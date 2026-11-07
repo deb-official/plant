@@ -1,0 +1,24 @@
+website:
+  sidebar:
+    contents:
+      - index.ipynb
+      - 00_utils.ipynb
+      - 01_layers.ipynb
+      - 02_text.models.core.ipynb
+      - 03_text.learner.ipynb
+      - 04_metrics.ipynb
+      - 05_collab.ipynb
+      - 06_data.transforms.ipynb
+      - 07_l2r.models.core.ipynb
+      - 08_l2r.gradients.ipynb
+      - 09_l2r.learner.ipynb
+      - 10_l2r.data.load.ipynb
+      - 11_l2r.callbacks.ipynb
+      - 12_data.external.ipynb
+      - 13_l2r.data.info_gain.ipynb
+      - 14_tutorial.boot_l2r.ipynb
+      - 15_l2r.data.stat.ipynb
+      - 17_tutorial.train_l2r.ipynb
+      - 18_tutorial.train_mimic3.ipynb
+      - 19_text.callbacks.ipynb
+      - tutorial.ipynb

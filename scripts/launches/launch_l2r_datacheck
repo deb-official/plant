@@ -1,0 +1,126 @@
+#!/bin/bash
+# =============================================================================
+# Launch Script for Learning to Rank Data Check
+# =============================================================================
+
+# Default values
+SOURCE_URL="XURLs.MIMIC4_L2R"
+DATA="mimic4_icd10_full"
+BASE_DIR="../tmp"
+OUTPUT_DIR="task2_output"
+LOGFILE="l2r_datacheck"
+RUN_ANALYSIS=true
+
+# Help function
+function show_help {
+    echo "Usage: $0 [options]"
+    echo
+    echo "Options:"
+    echo "  --source_url=URL       Source URL for data (default: XURLs.MIMIC4_L2R)"
+    echo "  --data=NAME            Dataset name (default: mimic4_icd10_full)"
+    echo "  --base_dir=DIR         Base directory (default: ../tmp)"
+    echo "  --output_dir=DIR       Output directory (default: task2_output)"
+    echo "  --logfile=NAME         Log file name (default: l2r_datacheck)"
+    echo "  --no-analysis          Skip analysis of loaded data"
+    echo "  --help                 Show this help message"
+    echo
+    echo "Example:"
+    echo "  $0 --source_url=\"XURLs.MIMIC4_DEMO\" --data=\"mimic4_icd10_full\" --base_dir=\"../tmp\" --output_dir=\"mimic4_l2rboot\""
+    echo
+}
+
+# Parse command-line arguments
+for arg in "$@"; do
+    case $arg in
+        --source_url=*)
+            SOURCE_URL="${arg#*=}"
+            shift
+            ;;
+        --data=*)
+            DATA="${arg#*=}"
+            shift
+            ;;
+        --base_dir=*)
+            BASE_DIR="${arg#*=}"
+            shift
+            ;;
+        --output_dir=*)
+            OUTPUT_DIR="${arg#*=}"
+            shift
+            ;;
+        --logfile=*)
+            LOGFILE="${arg#*=}"
+            shift
+            ;;
+        --no-analysis)
+            RUN_ANALYSIS=false
+            shift
+            ;;
+        --help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Convert the boolean to Python format
+if [ "$RUN_ANALYSIS" = true ]; then
+    PYTHON_RUN_ANALYSIS="True"
+else
+    PYTHON_RUN_ANALYSIS="False"
+fi
+
+# Get the directory of this script
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( dirname "$SCRIPT_DIR" )"
+
+# Derive the path to the Python script
+PYTHON_SCRIPT="$PROJECT_ROOT/l2r_dataload.py"
+
+# Check if the Python script exists
+if [ ! -f "$PYTHON_SCRIPT" ]; then
+    echo "Error: Python script not found at $PYTHON_SCRIPT"
+    echo "Make sure the l2r_dataload.py file is in the project root directory."
+    exit 1
+fi
+
+# Execute the Python script with the provided arguments
+# Execute the Python script with the provided arguments
+echo "Starting L2R data check..."
+echo "================================================================================"
+echo "LAUNCHING L2R DATA CHECK"
+echo "================================================================================"
+echo "Source URL: $SOURCE_URL"
+echo "Data: $DATA"
+echo "Base directory: $BASE_DIR"
+echo "Output directory: $OUTPUT_DIR"
+echo "Log file: $LOGFILE"
+echo "Run analysis: $RUN_ANALYSIS"
+echo "--------------------------------------------------------------------------------"
+
+# Create base directory if it doesn't exist
+if [ ! -z "$BASE_DIR" ]; then
+    mkdir -p "$BASE_DIR"
+fi
+
+# Execute the Python script
+python "$PYTHON_SCRIPT" \
+    --source_url="$SOURCE_URL" \
+    --data="$DATA" \
+    --base_dir="$BASE_DIR" \
+    --output_dir="$OUTPUT_DIR" \
+    --logfile="$LOGFILE" \
+    --run_analysis=$PYTHON_RUN_ANALYSIS
+
+# Check the exit status
+if [ $? -eq 0 ]; then
+    echo "L2R data check completed successfully."
+else
+    echo "Error executing L2R data check. See log for details."
+    exit 1
+fi

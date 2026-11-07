@@ -1,0 +1,89 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Launch Script for multilabel_classify.py with Accelerate
+#
+# This script sets default parameters for multilabel_classify.py, allows for command‐
+# line overrides, and runs the script with Accelerate. Finally, it lists the
+# generated files.
+#
+# Usage:
+#   ./launch_finetune.sh [--key=value ...]
+#
+# Any provided command-line argument will override the corresponding default.
+# -----------------------------------------------------------------------------
+
+# Step 1: Initialize an Associative Array for Defaults
+declare -A defaults=(
+    [--source_url]="XURLs.MIMIC4_DEMO"
+    [--data]="mimic4_icd10_full"
+    [--max_length]=512
+)
+
+declare -A args=()  # This array will store the final arguments
+
+# Step 2: Parse Command-Line Arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --*=*)
+            key="${1%%=*}"      # Key is everything before '='
+            value="${1#*=}"      # Value is everything after '='
+            args[$key]="$value"  # Override defaults if provided
+            shift
+            ;;
+        --*)
+            key="$1"
+            # If the next argument is another flag or missing, treat as flag-only.
+            if [[ "$2" == --* ]] || [[ -z "$2" ]]; then
+                args[$key]=""
+            else
+                args[$key]="$2"
+                shift
+            fi
+            shift
+            ;;
+        *)
+            echo "Warning: Ignoring unrecognized argument format: $1"
+            shift
+            ;;
+    esac
+done
+
+# Step 3: Merge Command-Line Arguments with Defaults
+for key in "${!defaults[@]}"; do
+    if [[ -z "${args[$key]}" ]]; then  # Use default if key is not set by CLI
+        args[$key]="${defaults[$key]}"
+    fi
+done
+
+# Step 4: Prepare Arguments for the Python Script
+final_args=()
+for key in "${!args[@]}"; do
+    if [[ -z "${args[$key]}" ]]; then
+        final_args+=("$key")          # Flag-only parameter
+    else
+        final_args+=("$key=${args[$key]}")  # Key-value pair
+    fi
+done
+
+# Print all arguments for verification
+echo "All arguments for multilabel_class.py:"
+for arg in "${final_args[@]}"; do
+    echo "$arg"
+done
+
+# Step 5: Run the Python Script with Accelerate
+# Set environment variables if necessary.
+export TOKENIZERS_PARALLELISM=False
+
+# python -m pdb \
+# bf16, not fp16: multilabel_classify.py's TrainingArguments hardcodes
+# bf16=True (matches the bf16 model loads + bnb compute dtype); a mismatched
+# --mixed_precision here doesn't fix/break the Phi-3-small rope bug (that's
+# a buffer-construction issue orthogonal to autocast -- see learning2rank.py's
+# load_base_model_and_tokenizer), but leaving it as fp16 while
+# TrainingArguments says bf16 is a needless inconsistency.
+accelerate launch --mixed_precision=bf16 --gpu_ids 0 \
+    multilabel_classify.py "${final_args[@]}"
+
+# Clean up environment variables
+unset TOKENIZERS_PARALLELISM

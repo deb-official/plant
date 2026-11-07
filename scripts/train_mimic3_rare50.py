@@ -1,0 +1,520 @@
+from accelerate.utils import DistributedDataParallelKwargs
+from fastcore.script import *
+from fastai.distributed import *
+from fastprogress import fastprogress
+from fastai.text.all import *
+import wandb; from fastai.callback.wandb import *
+from xcube.text.all import *
+from fastai.metrics import accuracy # there's an 'accuracy' metric in xcube as well
+
+# extra imports <remove later>
+import warnings; warnings.filterwarnings(action='ignore')
+# end extra imports
+
+torch.backends.cudnn.benchmark = True
+fastprogress.MAX_COLS = 80
+def pr(s):
+    if rank_distrib()==0: print(s)
+
+@patch
+def after_batch(self: ProgressCallback):
+        self.pbar.update(self.iter+1)
+        mets = ('_valid_mets', '_train_mets')[self.training]
+        self.pbar.comment = ' '.join([f'{met.name} = {met.value.item():.4f}' for met in getattr(self.recorder, mets)])
+
+@patch
+def before_fit(self: Recorder):
+        "Prepare state for training"
+        self.lrs,self.iters,self.losses,self.values = [],[],[],[]
+        names = self.metrics.attrgot('name')
+        names[-2] += '_macro'
+        names[-1] += '_micro'
+        if self.train_metrics and self.valid_metrics:
+            names = L('loss') + names
+            names = names.map('train_{}') + names.map('valid_{}')
+        elif self.valid_metrics: names = L('train_loss', 'valid_loss') + names
+        else: names = L('train_loss') + names
+        if self.add_time: names.append('time')
+        self.metric_names = 'epoch'+names
+        self.smooth_loss.reset()
+
+@patch
+def after_pred(self: RNNCallback): 
+    "Save the raw and dropped-out outputs and only keep the true output for loss computation"
+    self.learn.pred,self.raw_out,self.out, _, self.learn.loss_lm = [o[-1] if is_listy(o) else o for o in self.pred]
+
+class TestCallback(Callback):
+    order = 1000 
+
+    def before_backward(self):
+        import pdb; pdb.set_trace()
+    def after_backward(self):
+        import pdb; pdb.set_trace()    
+    def before_step(self):
+        import pdb; pdb.set_trace()
+    def after_step(self):
+        import pdb; pdb.set_trace()
+
+class RarePrecisionCallback(Callback):
+    order=Recorder.order-1
+    def __init__(self, rare_codes_fname):
+        self.rare_codes = load_pickle(rare_codes_fname)
+    def before_validate(self):
+        # import pdb; pdb.set_trace()
+        rare_idxs = mapt(self.dls.vocab[1].o2i.get, self.rare_codes)
+        rare_prec = partial(rareprecision_at_k, rare_idxs=rare_idxs)
+        self.learn.metrics += mk_metric(rare_prec)
+    # def after_batch(self):
+    #     if self.training: return
+    #     import pdb; pdb.set_trace()
+
+class ShortEpochCallback(Callback):
+    "Fit just `pct` of an epoch, then stop"
+    order=Recorder.order+1
+    def __init__(self,pct=0.01,short_valid=True): self.pct,self.short_valid = pct,short_valid
+    def after_batch(self):
+        if self.iter/self.n_iter < self.pct: return
+        if self.training:    raise CancelTrainException
+        if self.short_valid: raise CancelValidException
+    def after_cancel_train(self):
+        if getattr(self.recorder, 'cancel_train', True):
+            setattr(self.recorder, 'cancel_train', False)
+    # def after_cancel_validate(self):
+    #     import pdb; pdb.set_trace()
+    #     if getattr(self.recorder, 'cancel_valid', True):
+    #         setattr(self.recorder, 'cancel_valid', False)
+
+def splitter(df):
+    train = df.index[~df['is_valid']].tolist()
+    valid = df.index[df['is_valid']].to_list()
+    return train, valid
+
+def get_dls(source, data, bs, sl=16, workers=None, lm_vocab_file='mimic3-9k_dls_lm_vocab.pkl', bwd=False):
+    workers = ifnone(workers,min(8,num_cpus()))
+    data = join_path_file(data, source, ext='.csv')
+    # mimic3
+    df = pd.read_csv(data,
+                 header=0,
+                 names=['subject_id', 'hadm_id', 'text', 'labels', 'length', 'is_valid', 'split'],
+                 dtype={'subject_id': str, 'hadm_id': str, 'text': str, 'labels': str, 'length': np.int64, 'is_valid': bool, 'split': str})
+    # mimic4
+    # df = pd.read_csv(data,
+    #              header=0,
+    #              usecols=['subject_id', '_id', 'text', 'labels', 'num_targets', 'is_valid', 'split'],
+    #              dtype={'subject_id': str, '_id': str, 'text': str, 'labels': str, 'num_targets': np.int64, 'is_valid': bool, 'split': str})
+    df[['text', 'labels']] = df[['text', 'labels']].astype(str)
+    lbl_freqs = Counter()
+    for labels in df.labels: lbl_freqs.update(labels.split(';'))
+    lbls = list(lbl_freqs.keys())
+    splits = splitter(df)
+    # lm_vocab = torch.load(source/'mimic3-9k_dls_lm_vocab.pkl')
+    # import pdb; pdb.set_trace()
+    lm_vocab = torch.load(source/lm_vocab_file)
+    x_tfms = [Tokenizer.from_df('text', n_workers=workers), attrgetter("text"), Numericalize(vocab=lm_vocab)]
+    if bwd : x_tfms = x_tfms + [reverse_text] 
+    y_tfms = [ColReader('labels', label_delim=';'), MultiCategorize(vocab=lbls), OneHotEncode()]
+    tfms = [x_tfms, y_tfms]
+    dsets = Datasets(df, tfms, splits=splits)
+    dl_type = partial(SortedDL, shuffle=True)
+    dls_clas = dsets.dataloaders(bs=bs, seq_len=sl,
+                             dl_type=dl_type,
+                             before_batch=pad_input_chunk, num_workers=workers)
+    return dls_clas
+
+# change dev_dl before using it
+def get_dev_dl(source, data, bs, sl=16, workers=None, lm_vocab_file='mimic3-9k_dls_lm_vocab.pkl', bwd=False):
+    workers = ifnone(workers,min(8,num_cpus()))
+    data = join_path_file(data, source, ext='.csv')
+    # mimic3
+    df = pd.read_csv(data,
+                 header=0,
+                 names=['subject_id', 'hadm_id', 'text', 'labels', 'length', 'is_valid', 'split'],
+                 dtype={'subject_id': str, 'hadm_id': str, 'text': str, 'labels': str, 'length': np.int64, 'is_valid': bool, 'split': str})
+    # mimic4
+    # df = pd.read_csv(data,
+    #              header=0,
+    #              usecols=['subject_id', '_id', 'text', 'labels', 'num_targets', 'is_valid', 'split'],
+    #              dtype={'subject_id': str, '_id': str, 'text': str, 'labels': str, 'num_targets': np.int64, 'is_valid': bool, 'split': str})
+    df[['text', 'labels']] = df[['text', 'labels']].astype(str)
+
+    # pdb.set_trace()
+    lbl_freqs = Counter()
+    for labels in df.labels: lbl_freqs.update(labels.split(';'))
+    lbls = list(lbl_freqs.keys())
+    splits = splitter(df)
+    lm_vocab = torch.load(source/lm_vocab_file)
+    x_tfms = [Tokenizer.from_df('text', n_workers=workers), attrgetter("text"), Numericalize(vocab=lm_vocab)]
+    y_tfms = [ColReader('labels', label_delim=';'), MultiCategorize(vocab=lbls), OneHotEncode()]
+    tfms = [x_tfms, y_tfms]
+    val_split_name = 'val' if 'val' in df['split'].unique() else 'dev'
+    if val_split_name not in ('val', 'dev'): raise ValueError("The split field of the dataframe doesnot contain 'val' or 'dev'")
+    dev_dset = Datasets(df[df['split']==val_split_name], tfms)
+    dl_type = partial(SortedDL, shuffle=True)
+    dev_dl = TfmdDL(dev_dset, bs=bs, seq_len=sl,
+                             dl_type=dl_type,
+                             before_batch=pad_input_chunk, num_workers=workers, device=default_device())
+    return dev_dl
+
+def compute_lbs_frqs(source, data, label_list):
+    data = join_path_file(data, source, ext='.csv')
+    df = pd.read_csv(data,
+                 header=0,
+                 names=['subject_id', 'hadm_id', 'text', 'labels', 'length', 'is_valid', 'split'],
+                 dtype={'subject_id': str, 'hadm_id': str, 'text': str, 'labels': str, 'length': np.int64, 'is_valid': bool, 'split': str})
+    df[['text', 'labels']] = df[['text', 'labels']].astype(str)
+    lbl_freqs = Counter()
+    for labels in df.labels: lbl_freqs.update(labels.split(';'))
+    if set(lbl_freqs.keys()) != set(label_list):
+        print(f"There are some labels in the test set that are not in training set")
+    return lbl_freqs
+
+
+def train_linear_attn(learn, epochs, lrs, lrs_sgdr, wd_linattn, fit_sgdr=False, sgdr_n_cycles=4):
+    
+    ic(lrs_sgdr)
+    if epochs[0] or epochs[1]:
+        print("unfreezing the last layer...")
+        if fit_sgdr: learn.fit_sgdr(sgdr_n_cycles, 1, lr_max=lrs_sgdr[0][0], wd=wd_linattn[0])
+        else:  learn.fit(epochs[0]+epochs[1], lr=lrs[0][0])
+
+    if epochs[2]:
+        print("unfreezing one LSTM...")
+        learn.freeze_to(-2)
+        learn.fit(epochs[2], lr=lrs[2][0], wd=wd_linattn[1])
+
+    if epochs[3]:
+        print("unfreezing one more LSTM...")
+        learn.freeze_to(-3)
+        learn.fit(epochs[3], lr=lrs[3][0], wd=wd_linattn[2])
+
+    if epochs[4]:
+        print("unfreezing the entire model...")
+        learn.unfreeze()
+        learn.fit(epochs[4], lr=lrs[4][0], wd=wd_linattn[3])
+
+    print("Done!!!")
+    # print(f"lin_wt = {learn.model[1].pay_attn.wgts[0]}, plant_wt = {learn.model[1].pay_attn.wgts[1]}, splant_wt = {learn.model[1].pay_attn.wgts[2]}")
+
+def train_plant(learn, epochs, lrs, lrs_sgdr, wd_plant, wd_mul_plant, fit_sgdr=False, unfreeze_l2r=False,sgdr_n_cycles=4):
+    # import pdb; pdb.set_trace()
+    if epochs[0]: # unfreeze the clas decoder and the l2r
+        print("unfreezing the last layer and potentially the pretrained l2r...")
+        learn.freeze_to(-2 if unfreeze_l2r else -1) 
+        # learn.fit_sgdr(4, 1, lr_max=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-3, 0.2], wd=[0.01, 0.01, 0.01, 0.01, 0.01, 0.1, 0.01]) #top
+        # ic(f"classification layer: {learn.opt.param_lists[-1].attrgot('requires_grad')}")
+        # ic(f"pretrained l2r layer: {learn.opt.param_lists[-2].attrgot('requires_grad')}")
+        # ic(f"pretrained l2r layer: {learn.opt.param_lists[-2].attrgot('shape')}")
+        # ic(f"lm decoder layer: {learn.opt.param_lists[-3].attrgot('requires_grad')}")
+        ic(lrs_sgdr)
+        if fit_sgdr: learn.fit_sgdr(sgdr_n_cycles, 1, lr_max=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs_sgdr[0][1], lrs_sgdr[0][0]], wd=wd_mul_plant[0]*array(wd_plant), ) #rare
+        else: learn.fit(epochs[0], lr=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs[0][1], lrs[0][0]], wd=wd_mul_plant[0]*array(wd_plant))
+        # learn.fit_sgdr(4, 1, lr_max=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-2, 0.6], wd=[0.01, 0.01, 0.01, 0.01, 0.01, 0.1, 0.01]) #tiny
+        # print(f"lin_wt = {learn.model[1].pay_attn.wgts[0]}, plant_wt = {learn.model[1].pay_attn.wgts[1]}, splant_wt = {learn.model[1].pay_attn.wgts[2]}")
+        # print(learn.opt.hypers)
+
+    if epochs[1]: # unfreeze the lm decoder
+        print("unfreezing the LM decoder...")
+        learn.freeze_to(-3) 
+        # ic(f"classification layer: {learn.opt.param_lists[-1].attrgot('requires_grad')}")
+        # ic(f"pretrained l2r layer: {learn.opt.param_lists[-2].attrgot('requires_grad')}")
+        # ic(f"lm decoder layer: {learn.opt.param_lists[-3].attrgot('requires_grad')}")
+        ic(lrs_sgdr)
+        if fit_sgdr: learn.fit_sgdr(sgdr_n_cycles, 1, lr_max=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs_sgdr[1][1], lrs_sgdr[1][0]], wd=wd_mul_plant[1]*array(wd_plant))
+        else: learn.fit(epochs[1], lr=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs[1][1], lrs[1][0]], wd=wd_mul_plant[1]*array(wd_plant))
+        print(f"lin_wt = {learn.model[1].pay_attn.wgts[0]}, plant_wt = {learn.model[1].pay_attn.wgts[1]}, splant_wt = {learn.model[1].pay_attn.wgts[2]}")
+
+    if epochs[2]: # unfreeze one LSTM
+        print("unfreezing one LSTM...")
+        learn.freeze_to(-4) 
+        learn.fit(epochs[2], lr=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs[2][1], lrs[2][0]], wd=wd_mul_plant[2]*array(wd_plant))
+        # learn.fit_sgdr(sgdr_n_cycles, 1, lr_max=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs[2][1], 0.15], wd=wd_mul_plant[2]*array(wd_plant))
+        print(f"lin_wt = {learn.model[1].pay_attn.wgts[0]}, plant_wt = {learn.model[1].pay_attn.wgts[1]}, splant_wt = {learn.model[1].pay_attn.wgts[2]}")
+
+    if epochs[3]: # unfreeze one more LSTM
+        print("unfreezing one more LSTM...")
+        learn.freeze_to(-5) 
+        learn.fit(epochs[3], lr=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs[3][1], lrs[3][0]], wd=[0.3]*7)
+        # learn.fit_sgdr(sgdr_n_cycles, 1, lr_max=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs_sgdr[3][1], lrs_sgdr[3][0]], wd=[0.3]*7)
+        print(f"lin_wt = {learn.model[1].pay_attn.wgts[0]}, plant_wt = {learn.model[1].pay_attn.wgts[1]}, splant_wt = {learn.model[1].pay_attn.wgts[2]}")
+
+    if epochs[4]: # unfreeze the rest
+        print("unfreezing the entire model...")
+        learn.unfreeze() 
+        learn.fit(epochs[4], lr=[1e-6, 1e-6, 1e-6, 1e-6, 1e-6, lrs[4][1], lrs[4][0]], wd=wd_mul_plant[4]*array(wd_plant))
+
+    print("Done!!!")
+    # print(f"lin_wt = {learn.model[1].pay_attn.wgts[0]}, plant_wt = {learn.model[1].pay_attn.wgts[1]}, splant_wt = {learn.model[1].pay_attn.wgts[2]}")
+
+@delegates()
+class TstLearner(Learner):
+    def __init__(self, dls=None, model=None, **kwargs): self.pred, self.xb, self.yb = None, None, None
+
+def compute_val(met, pred, targ, bs=16):
+    met.reset()
+    learn = TstLearner()
+    for learn.pred,learn.yb in zip(torch.split(pred, bs), torch.split(targ, bs)): met.accumulate(learn)
+    return met.value
+
+def compute_val2(met, dl, learn, pred, targ):
+    learn.model.eval()
+    met.reset()
+    _tst_learn = TstLearner()
+    pdb.set_trace()
+    for xb,yb in dl:
+        _tst_learn.yb = yb
+        _tst_learn.pred, *_ = learn.model(xb)
+        met.accumulate(_tst_learn)
+    return met.value
+
+class CancelValid(Callback):
+    order = 100
+    def before_validate(self): 
+        import pdb; pdb.set_trace()
+        raise CancelValidException()
+
+def _print_metrics(vals, learn):
+    print(f"test_loss = {vals[0]}")
+    for m,v in zip(learn.metrics[:4], vals[1:5]):
+        if not isinstance(m.func, partial): raise AssertionError 
+        func = m.func.func
+        name = '_'.join(L(m.name.split('_')[:-1] + [m.func.keywords['k']]).map(str))
+        print(f"{name} = {v}")
+    for m,v in zip(learn.metrics[4:], vals[5:]):
+        name = m.name + '_' + m.kwargs['average']
+        print(f"{name} = {v}")
+
+def plot_f1_macro_per_label(yhat, y, label_to_id=None, lbs_frqs=None, plot_file=None):
+    # Compute macro F1 score for each label class
+    macro_f1_lbs = macro_f1_score_per_label(yhat, y)
+    label_to_macro = {lbl: macro_f1_lbs[id] for lbl,id in label_to_id.items()}
+    # Sort labels based on frequencies
+    sorted_labels = sorted(lbs_frqs.keys(), key=lambda x: lbs_frqs[x])
+    # Extract macro F1 scores corresponding to sorted labels
+    macro_f1_scores_of_sorted_labels = [label_to_macro[label] for label in sorted_labels]
+
+    plt.figure(figsize=(10, 6))
+    # plt.bar(sorted_labels, macro_f1_scores, color='skyblue')
+    plt.plot(range(len(sorted_labels)), macro_f1_scores_of_sorted_labels, color='skyblue')
+    plt.xlabel('Label Ids (Sorted by Frequencies)')
+    plt.ylabel('Macro F1 Score')
+    plt.ylim([-0.2, max(macro_f1_scores_of_sorted_labels) + 1])
+    plt.title(f'Macro F1 Scores for Labels Sorted by Frequencies: {macro_f1_lbs.mean().item()}')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    # import pdb; pdb.set_trace()
+
+    # Save the plot
+    plt.savefig(plot_file)
+    # plt.show()
+
+    with open(plot_file.name.replace('png', 'txt'), 'w') as file:
+        for lbl in sorted_labels:
+            file.write(f"{str(lbl)}\t{lbs_frqs[lbl]}\t{label_to_macro[lbl]}\n")
+        
+
+@call_parse
+def main(
+    source_url: Param("Source url", str)="XURLs.MIMIC3",
+    source_url_l2r: Param("Source url", str)="XURLs.MIMIC3_L2R",
+    data:  Param("Filename of the raw data", str)="mimic3-9k",
+    rarecodes_fname: Param("Filename of the rare codes", str)="xxx",
+    lr:    Param("base Learning rate", float)=1e-2,
+    bs:    Param("Batch size", int)=16,
+    epochs:Param("Number of epochs", str)="[10, 5, 5, 5, 10]",
+    lrs_linattn:   Param("Learning rates for gradual unfreezing of the layers in linear attention", str)="[(3e-2,1e-3), (1e-2,1e-3), (1e-2, 1e-3), (1e-2,1e-3), (1e-6,1e-6)]",
+    lrs_plant:   Param("Learning rates of the last layer and lm decoder for gradual unfreezing in plant", str)="[(3e-2,1e-3), (1e-2,1e-3), (1e-2, 1e-3), (1e-2,1e-3), (1e-6,1e-6)]",
+    lrs_sgdr_linattn:   Param("Learning rates for gradual unfreezing of the layers in linear attention with sgd", str)="[(3e-2,1e-3), (1e-2,1e-3), (1e-2, 1e-3), (1e-2,1e-3), (1e-6,1e-6)]",
+    lrs_sgdr_plant:   Param("Learning rates of the last layer and lm decoder for gradual unfreezing in plant with sgd", str)="[(3e-2,1e-3), (1e-2,1e-3), (1e-2, 1e-3), (1e-2,1e-3), (1e-6,1e-6)]",
+    wd_linattn:Param("Weight decays for the gradual unfreezing", str)="[0.01, 0.01, 0.01, 0.3]",
+    wd_plant:Param("Discriminative weight decays", str)="[0.01, 0.01, 0.01, 0.01, 0.01, 0.1, 0.01]",
+    wd_mul_plant:Param("Multipliers for weight decays for the gradual unfreezing", str)="[1.0, 1.0, 1.0, 1.0, 30.0]",
+    fp16:  Param("Use mixed precision training", store_true)=False,
+    lm:    Param("Use Pretrained LM", store_true)=False,
+    plant: Param("PLANT attention", bool_arg)=True,
+    static_inattn:    Param("base Learning rate", int)=5,
+    diff_inattn:    Param("base Learning rate", int)=30,
+    fit_sgdr: Param("PLANT attention", store_true)=False,
+    lowshot: Param("Low shot setting", store_true)=False,
+    unfreeze_l2r: Param("Unfreeze L2R along with last layer while gradual unfreezing", store_true)=False,
+    no_running_decoder: Param("Train XMTC model with stateful decoder", bool_arg)=True,
+    sgdr_n_cycles:    Param("base Learning rate", int)=4,
+    attn_init: Param("Initial wgts for Linear, Diff. PLANT and Static PLANT", str)="(0, 0, 1)",
+    dump:  Param("Print model; don't train", int)=0,
+    runs:  Param("Number of times to repeat training", int)=1,
+    track_train: Param("Record training metrics", store_true)=False,
+    wandblog: Param("Experiment tracking in wandb.ai", store_true)=False,
+    log: Param("Log loss and metrics after each epoch", store_true)=False,
+    workers:   Param("Number of workers", int)=None,
+    save_model: Param("Save model on improvement after each epoch", store_true)=False,
+    root_dir: Param("Root dir for saving models", str)="..",
+    fname: Param("Save model file", str)="mimic3-9k",
+    infer: Param("Don't train, just validate", int)=0,
+    metrics: Param("Metrics used in inference", str)="partial(precision_at_k, k=15)",
+    files_lm: Param("MIMIC LM files (comma seperated fine-tuned lm, decoder, lm_vocab)", str)="mimic3-9k_lm_finetuned.pth,mimic3-9k_lm_decoder.pth,mimic3-9k_dls_lm_vocab.pkl",
+    files_l2r: Param("MIMIC L2R files (comma seperated)", str)="mimic3-9k_tok_lbl_info.pkl,p_L.pkl,lin_lambdarank_full.pth",
+    trn_frm_cpt: Param("Train from saved checkpoint", store_true)=False,
+    bwd: Param("Train the bwd classifier", store_true)=False
+):
+    "Training of mimic classifier."
+
+    source = rank0_first(untar_xxx, eval(source_url))
+    source_l2r = rank0_first(untar_xxx, eval(source_url_l2r))
+
+    # make tmp directory to save and load models and dataloaders
+    # pdb.set_trace()
+    tmp = Path(root_dir)/'tmp/models'
+    tmp.mkdir(exist_ok=True, parents=True)
+    tmp = tmp.parent
+    # files_mimic = 'mimic3-9k_lm_finetuned.pth mimic3-9k_lm_decoder.pth'.split(' ')
+    files_lm = files_lm.split(',')
+    for f in files_lm:
+        if not (tmp/'models'/f).exists():
+            (tmp/'models'/f).symlink_to(source/f) 
+    # files_mimic_l2r = 'mimic3-9k_tok_lbl_info.pkl p_L.pkl lin_lambdarank_full.pth'.split(' ')
+    files_l2r = files_l2r.split(',')
+    for f in files_l2r:
+        if not (tmp/'models'/f).exists():
+            (tmp/'models'/f).symlink_to(source_l2r/f) 
+    # loading dataloaders
+    dls_name = '_dls_clas_bwd_' if bwd else '_dls_clas_' 
+    dls_file = join_path_file(data+dls_name+str(bs), tmp, ext='.pkl')
+    if dls_file.exists(): 
+        dls_clas = torch.load(dls_file, map_location=torch.device('cpu'))
+    else:
+        dls_clas = get_dls(source, data, bs, workers=workers, lm_vocab_file=files_lm[2], bwd=bwd)
+        torch.save(dls_clas, dls_file)
+
+    epochs = json.loads(epochs)
+    lrs_linattn = [L(match.split(',')).map(float) for match in re.findall(r'\((.*?)\)', lrs_linattn)]
+    lrs_plant = [L(match.split(',')).map(float) for match in re.findall(r'\((.*?)\)', lrs_plant)]
+    lrs_sgdr_linattn = [L(match.split(',')).map(float) for match in re.findall(r'\((.*?)\)', lrs_sgdr_linattn)]
+    lrs_sgdr_plant = [L(match.split(',')).map(float) for match in re.findall(r'\((.*?)\)', lrs_sgdr_plant)]
+    wd_linattn = json.loads(wd_linattn)
+    wd_plant = json.loads(wd_plant)
+    wd_mul_plant = json.loads(wd_mul_plant)
+    for run in range(runs):
+        set_seed(1, reproducible=True)
+        pr(f'Rank[{rank_distrib()}] Run: {run}; epochs: {sum(epochs)}; lr: {lr}; bs: {bs}')
+
+        cbs = SaveModelCallback(monitor='valid_f1_score_macro', fname=fname, with_opt=True, reset_on_fit=False) if save_model else None
+        if not infer and log: 
+            logfname = join_path_file(fname, tmp, ext='.csv')
+            if not trn_frm_cpt and logfname.exists(): logfname.unlink() # don't delete if from training from chkpt
+            cbs += L(CSVLogger(fname=logfname, append=True))
+        if wandblog: cbs += L(WandbCallback(log_preds=False, log_model=True, model_name=fname))
+        # cbs += L(ShortEpochCallback(pct=0.7, short_valid=False))
+        # cbs += L(TestCallback())
+        learn = rank0_first(xmltext_classifier_learner, dls_clas, AWD_LSTM, drop_mult=0.1, max_len=72*40,
+                                   metrics=[partial(precision_at_k, k=15), F1ScoreMulti(thresh=0.5, average='macro'), F1ScoreMulti(thresh=0.5, average='micro')], path=tmp, cbs=cbs,
+                                #    metrics=[partial(precision_at_k, k=15)], path=tmp, cbs=cbs,
+                                   pretrained=False,
+                                   splitter=None,
+                                   running_decoder=not no_running_decoder,
+                                   attn_init=ast.literal_eval(attn_init),
+                                   static_inattn=static_inattn,
+                                   diff_inattn=diff_inattn,
+                                   lowshot=lowshot
+                                   )
+        if track_train: 
+            assert learn.cbs[1].__class__ is Recorder
+            setattr(learn.cbs[1], 'train_metrics', true)
+
+        if dump: pr(learn.model); exit()
+        if fp16: learn = learn.to_fp16()
+        # if lm: learn = rank0_first(learn.load_encoder, 'mimic3-9k_lm_finetuned')
+        # import pdb; pdb.set_trace()
+        if lm: learn = rank0_first(learn.load_encoder, files_lm[0].split('.')[0]) # change for bwd
+        if plant: 
+            # import IPython; IPython.embed()
+            # 'tok_lbl_info', 'p_L', 'lin_lambdarank', 'lm_decoder'
+            brain = L(*files_l2r, files_lm[1]).map(lambda o: o.split('.')[0])
+            # learn = rank0_first(learn.load_both, 'mimic3-9k_tok_lbl_info', 'p_L', 'lin_lambdarank_full', 'mimic3-9k_lm_decoder')
+            learn = rank0_first(learn.load_both, *brain)
+            setattr(learn, 'splitter', awd_lstm_xclas_split)
+            learn.create_opt()
+            # import IPython; IPython.embed()
+        if infer:
+            # learn.add_cb(RarePrecisionCallback(join_path_file(rarecodes_fname, source, ext='.pkl')))
+            learn.metrics = [eval(o) for o in metrics.split(';') if callable(eval(o))]
+            dev_dl = get_dev_dl(source, data, bs, workers=workers, lm_vocab_file=files_lm[2], bwd=bwd)
+            try: 
+                learn = learn.load(learn.save_model.fname)
+                # validate(learn, dl=dev_dl)
+                pred, targ = learn.get_preds(dl=dev_dl)
+                # now comment
+                xs = torch.linspace(0.05, 0.95, 30)
+                f1_macros = [compute_val(F1ScoreMulti(thresh=i, average='macro', sigmoid=False), pred, targ, bs=bs) for i in xs]
+                thresh_macro = xs[f1_macros.index(max(f1_macros))]
+
+                f1_micros =  [compute_val(F1ScoreMulti(thresh=i, average='micro', sigmoid=False), pred, targ, bs=bs) for i in xs]
+                thresh_micro = xs[f1_micros.index(max(f1_micros))]
+                
+                precision_macros = [compute_val(PrecisionMulti(thresh=i, average='macro', sigmoid=False), pred, targ, bs=bs) for i in xs]
+                precision_thresh_macro = xs[precision_macros.index(max(precision_macros))]
+                
+                precision_micros = [compute_val(PrecisionMulti(thresh=i, average='micro', sigmoid=False), pred, targ, bs=bs) for i in xs]
+                precision_thresh_micro = xs[precision_micros.index(max(precision_micros))]
+
+                recall_macros = [compute_val(RecallMulti(thresh=i, average='macro', sigmoid=False), pred, targ, bs=bs) for i in xs]
+                recall_thresh_macro = xs[recall_macros.index(max(recall_macros))]
+                
+                recall_micros = [compute_val(RecallMulti(thresh=i, average='micro', sigmoid=False), pred, targ, bs=bs) for i in xs]
+                recall_thresh_micro = xs[recall_micros.index(max(recall_micros))]
+
+                learn.metrics += F1ScoreMulti(thresh=thresh_macro, average='macro')
+                learn.metrics += F1ScoreMulti(thresh=thresh_micro, average='micro')
+                learn.metrics += PrecisionMulti(thresh=precision_thresh_macro, average='macro')
+                learn.metrics += RecallMulti(thresh=recall_thresh_macro, average='macro')
+                learn.metrics += PrecisionMulti(thresh=precision_thresh_micro, average='micro')
+                learn.metrics += RecallMulti(thresh=recall_thresh_micro, average='micro')
+
+                with suppress_stdout():
+                    vals = validate(learn)
+                metric_names = ['test_loss', 'precision@k', 'macro f1 (th=0.5)', 'micro f1 (th=0.5)', 'macro f1 (th=best)', 'micro f1 (th=best)', 'macro precision (th=best)', 'macro recall (th=best)', 'micro precision (th=best)', 'micro recall (th=best)'] 
+                for n,v in zip(metric_names, vals):
+                    print(f"{n} = {v}")
+                # Quick Fix: Removing the save callback to avoid error while grabbing preds
+                save_cb_idx = learn.cbs.argfirst(lambda o: isinstance(o, SaveModelCallback))
+                with learn.removed_cbs(learn.cbs[save_cb_idx]):
+                    pred, targ = learn.get_preds()
+                # Quick Fix End
+                print(auc_metrics(pred, targ))
+                # Plot f1_macros per label
+                label_to_id = learn.dls.vocab[1].o2i
+                label_list = [lbl for lbl in label_to_id.keys()]
+                lbs_frqs = compute_lbs_frqs(source, data, label_list)
+                yhat = (pred>thresh_macro).float()
+                plot_f1_macro_per_label(yhat, targ, label_to_id=label_to_id, lbs_frqs=lbs_frqs, plot_file=Path.cwd()/'macro_f1_plot.png')
+                #######
+
+            except FileNotFoundError as e: 
+                print("Exception:", e)
+                print("Trained model not found!")
+            except Exception as e:
+                # Handle other exceptions
+                print(f"Caught an exception: {e}")
+            finally: 
+                exit()
+        if trn_frm_cpt:
+            try:
+                ic(learn.save_model.fname)
+                ic(learn.save_model.reset_on_fit)
+                assert learn.save_model.reset_on_fit is False
+                learn = learn.load(learn.save_model.fname)
+                print("Validating the checkpointed model so that we can run from where we left of...")
+                vals = validate(learn)
+                print(f"We are monitoring {learn.save_model.monitor}. Set the best so far = {vals[1]}")
+                learn.save_model.best = vals[1]
+            except FileNotFoundError as e: 
+                print("Exception:", e)
+                print("Checkpoint model not found!")
+
+        # Workaround: In PyTorch 2.0.1 need to set DistributedDataParallel() with find_unused_parameters=True,
+        # to avoid a crash that only happens in distributed mode of xmltext_clasifier_learner.fit()
+        ddp_scaler = DistributedDataParallelKwargs(bucket_cap_mb=15, find_unused_parameters=True)
+        cms = learn.distrib_ctx(kwargs_handlers=[ddp_scaler])
+        if wandblog: cms += L(wandb.init())
+        with ContextManagers(cms):
+            if plant: train_plant(learn, epochs, lrs_plant, lrs_sgdr_plant, wd_plant, wd_mul_plant, fit_sgdr=fit_sgdr, unfreeze_l2r=unfreeze_l2r, sgdr_n_cycles=sgdr_n_cycles)
+            else: train_linear_attn(learn, epochs, lrs_linattn, lrs_sgdr_linattn, wd_linattn, fit_sgdr=fit_sgdr, sgdr_n_cycles=sgdr_n_cycles)
+
